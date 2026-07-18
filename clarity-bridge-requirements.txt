@@ -1,0 +1,4 @@
+# Pinned: the websockets API (extra_headers, request_headers) used in
+# cloud_connection.py changed significantly in 13.0+. Stay on 12.x.
+websockets==12.0
+MetaTrader5>=5.0.45
