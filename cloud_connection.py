@@ -4,7 +4,9 @@ Cloud Connection
 Secure WebSocket connection between Clarity Bridge and Clarity Cloud.
 
 This module handles:
-- Authentication with Clarity Cloud
+- Authentication with Clarity Cloud (via permanent device_id + device_secret,
+  established once during pairing — see device_auth.py. Not a login token;
+  Bridge runs unattended so it can't depend on a browser session expiring.)
 - Sending market data upstream
 - Receiving execution requests downstream
 - Automatic reconnection
@@ -12,43 +14,44 @@ This module handles:
 Contains NO intelligence. It is a pipe.
 """
 
-import asyncio
 import json
 import os
 from typing import AsyncIterator
 
 
-CLARITY_CLOUD_URL = os.environ.get(
-    "CLARITY_CLOUD_URL",
+CLARITY_CLOUD_WS_URL = os.environ.get(
+    "CLARITY_CLOUD_WS_URL",
     "wss://algo.clarity.trade/bridge/ws"
 )
 
 
 class CloudConnection:
 
-    def __init__(self, user_token: str):
-        self.user_token  = user_token
-        self._ws         = None
-        self._connected  = False
+    def __init__(self, device_id: str, device_secret: str):
+        self.device_id     = device_id
+        self.device_secret = device_secret
+        self._ws           = None
+        self._connected    = False
 
     async def connect(self) -> bool:
         try:
             import websockets
 
             self._ws = await websockets.connect(
-                CLARITY_CLOUD_URL,
-                extra_headers={"Authorization": f"Bearer {self.user_token}"},
+                CLARITY_CLOUD_WS_URL,
                 ping_interval = 20,
                 ping_timeout  = 10,
             )
 
-            # Send handshake
+            # Authenticate with our permanent device identity —
+            # no headers needed, so this works across websockets versions.
             await self._ws.send(json.dumps({
-                "type":    "bridge_connect",
-                "version": "1.0.0",
+                "type":          "bridge_connect",
+                "device_id":     self.device_id,
+                "device_secret": self.device_secret,
+                "version":       "1.0.0",
             }))
 
-            # Wait for acknowledgement
             response = json.loads(await self._ws.recv())
             if response.get("type") != "connected":
                 print(f"Handshake failed: {response}")

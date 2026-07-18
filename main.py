@@ -18,6 +18,7 @@ All intelligence lives in Clarity Cloud.
 
 import asyncio
 import json
+import os
 import time
 import sys
 from datetime import datetime
@@ -32,10 +33,9 @@ RECONNECT_DELAY = 5   # seconds between reconnect attempts
 
 class ClarityBridge:
 
-    def __init__(self, user_token: str):
-        self.user_token  = user_token
+    def __init__(self, device_id: str, device_secret: str):
         self.mt5         = MT5Connector()
-        self.cloud       = CloudConnection(user_token)
+        self.cloud       = CloudConnection(device_id, device_secret)
         self.running     = False
 
     async def start(self):
@@ -175,15 +175,17 @@ class ClarityBridge:
 
 
 async def main():
-    # Token comes from Clarity account (set on first launch via login screen)
-    import os
-    token = os.environ.get("CLARITY_USER_TOKEN")
-    if not token:
-        print("Please set CLARITY_USER_TOKEN environment variable.")
-        print("Get your token from Clarity Settings → Algo Connection.")
-        sys.exit(1)
+    from device_auth import load_device_credentials, prompt_for_pairing
 
-    bridge = ClarityBridge(user_token=token)
+    cloud_http_url = os.environ.get("CLARITY_CLOUD_HTTP_URL", "https://algo.clarity.trade")
+
+    device_id, device_secret = load_device_credentials()
+    if not device_id:
+        # First run — nothing paired yet. Ask for the 6-digit code
+        # shown in Clarity's browser UI (Algo -> Connect Broker).
+        device_id, device_secret = prompt_for_pairing(cloud_http_url)
+
+    bridge = ClarityBridge(device_id=device_id, device_secret=device_secret)
     await bridge.start()
 
 
