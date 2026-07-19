@@ -17,6 +17,20 @@ class MT5Connector:
     def __init__(self):
         self._mt5       = None
         self._connected = False
+        self._selected_symbols = set()  # cache — avoid redundant symbol_select calls
+
+    def _ensure_symbol(self, pair: str) -> bool:
+        """
+        MT5 only returns candle/tick data for symbols that are explicitly
+        'selected' (visible in Market Watch). Without this, copy_rates_from_pos()
+        and symbol_info_tick() silently return None even for valid symbols.
+        """
+        if pair in self._selected_symbols:
+            return True
+        if self._mt5.symbol_select(pair, True):
+            self._selected_symbols.add(pair)
+            return True
+        return False
 
     def connect(self) -> bool:
         try:
@@ -65,6 +79,8 @@ class MT5Connector:
     def get_price(self, pair: str) -> Optional[dict]:
         if not self._connected:
             return None
+        if not self._ensure_symbol(pair):
+            return None
         tick = self._mt5.symbol_info_tick(pair)
         if tick is None:
             return None
@@ -77,6 +93,8 @@ class MT5Connector:
 
     def get_candles(self, pair: str, timeframe: str, count: int = 500) -> Optional[list]:
         if not self._connected:
+            return None
+        if not self._ensure_symbol(pair):
             return None
 
         TF_MAP = {
@@ -137,6 +155,7 @@ class MT5Connector:
         if not self._connected:
             return {"success": False, "error": "MT5 not connected"}
 
+        self._ensure_symbol(pair)
         order_type = self._mt5.ORDER_TYPE_BUY if direction == "BUY" else self._mt5.ORDER_TYPE_SELL
 
         tick = self._mt5.symbol_info_tick(pair)

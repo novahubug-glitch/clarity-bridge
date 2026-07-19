@@ -21,7 +21,7 @@ import json
 import os
 import time
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from mt5_connector import MT5Connector
 from cloud_connection import CloudConnection
@@ -89,7 +89,7 @@ class ClarityBridge:
             try:
                 payload = {
                     "type":      "market_data",
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "account":   self.mt5.account_info(),
                     "prices":    {},
                     "candles":   {},
@@ -137,7 +137,7 @@ class ClarityBridge:
                         "type":      "execution_result",
                         "request_id": msg.get("request_id"),
                         "result":    result,
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
 
                 elif msg_type == "close_position":
@@ -146,7 +146,7 @@ class ClarityBridge:
                         "type":      "close_result",
                         "request_id": msg.get("request_id"),
                         "result":    result,
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
 
                 elif msg_type == "modify_position":
@@ -159,18 +159,18 @@ class ClarityBridge:
                         "type":      "modify_result",
                         "request_id": msg.get("request_id"),
                         "result":    result,
-                        "timestamp": datetime.utcnow().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
 
                 elif msg_type == "ping":
-                    await self.cloud.send({"type": "pong", "timestamp": datetime.utcnow().isoformat()})
+                    await self.cloud.send({"type": "pong", "timestamp": datetime.now(timezone.utc).isoformat()})
 
             except Exception as e:
                 print(f"Execute error: {e}")
                 await self.cloud.send({
                     "type":  "error",
                     "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
 
