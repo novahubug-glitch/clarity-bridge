@@ -18,30 +18,59 @@ class MT5Connector:
     def __init__(self):
         self._mt5       = None
         self._connected = False
-        self._selected_symbols = set()  # cache — avoid redundant symbol_select calls
+        self._symbol_map = {}  # canonical pair (e.g. "EURUSD") -> actual broker symbol name, or None if unresolvable
 
-    def _ensure_symbol(self, pair: str) -> bool:
+    def _resolve_symbol(self, pair: str) -> Optional[str]:
         """
-        MT5 only returns candle/tick data for symbols that are explicitly
-        'selected' (visible in Market Watch). Without this, copy_rates_from_pos()
-        and symbol_info_tick() silently return None even for valid symbols.
+        Different brokers name symbols differently — plain "EURUSD", or
+        suffixed like "EURUSDm" / "EURUSD.a" / "EURUSDpro" for different
+        account types. Resolve the canonical pair name to whatever this
+        specific broker actually calls it, once, and cache the mapping.
         """
-        if pair in self._selected_symbols:
-            return True
+        if pair in self._symbol_map:
+            return self._symbol_map[pair]
 
+        # Exact match first — most standard-account brokers use plain names
         info = self._mt5.symbol_info(pair)
+        if info is not None:
+            self._symbol_map[pair] = pair
+            return pair
+
+        # Fall back to searching all symbols this broker actually offers
+        all_symbols = self._mt5.symbols_get()
+        if all_symbols:
+            candidates = [s.name for s in all_symbols if s.name.upper().startswith(pair.upper())]
+            if candidates:
+                best = min(candidates, key=len)  # shortest match = least extra suffix
+                print(f"MT5: resolved '{pair}' -> broker symbol '{best}'")
+                self._symbol_map[pair] = best
+                return best
+
+        print(f"MT5: no symbol found for '{pair}' on this broker "
+              f"(checked {len(all_symbols or [])} available symbols)")
+        self._symbol_map[pair] = None
+        return None
+
+    def _ensure_symbol(self, pair: str) -> Optional[str]:
+        """
+        Resolves the pair to this broker's actual symbol name and makes
+        sure it's selected/visible. Returns the broker symbol name to use
+        in subsequent MT5 calls, or None if unavailable.
+        """
+        broker_symbol = self._resolve_symbol(pair)
+        if broker_symbol is None:
+            return None
+
+        info = self._mt5.symbol_info(broker_symbol)
         if info is None:
-            print(f"MT5: '{pair}' doesn't exist under this exact name for this broker. "
-                  f"last_error={self._mt5.last_error()}")
-            return False
+            return None
 
         if not info.visible:
-            if not self._mt5.symbol_select(pair, True):
-                print(f"MT5: symbol_select('{pair}') failed. last_error={self._mt5.last_error()}")
-                return False
+            if not self._mt5.symbol_select(broker_symbol, True):
+                print(f"MT5: symbol_select('{broker_symbol}') failed. last_error={self._mt5.last_error()}")
+                return None
 
-        self._selected_symbols.add(pair)
-        return True
+        return broker_symbol
 
     def connect(self) -> bool:
         try:
@@ -90,9 +119,10 @@ class MT5Connector:
     def get_price(self, pair: str) -> Optional[dict]:
         if not self._connected:
             return None
-        if not self._ensure_symbol(pair):
+        broker_symbol = self._ensure_symbol(pair)
+        if broker_symbol is None:
             return None
-        tick = self._mt5.symbol_info_tick(pair)
+        tick = self._mt5.symbol_info_tick(broker_symbol)
         if tick is None:
             return None
         return {
@@ -105,7 +135,8 @@ class MT5Connector:
     def get_candles(self, pair: str, timeframe: str, count: int = 500) -> Optional[list]:
         if not self._connected:
             return None
-        if not self._ensure_symbol(pair):
+        broker_symbol = self._ensure_symbol(pair)
+        if broker_symbol is None:
             return None
 
         TF_MAP = {
@@ -116,17 +147,15 @@ class MT5Connector:
         if tf is None:
             return None
 
-        # A freshly-selected symbol sometimes needs a moment for MT5 to sync
-        # history from the broker server — retry briefly before giving up.
         rates = None
         for attempt in range(3):
-            rates = self._mt5.copy_rates_from_pos(pair, tf, 0, count)
+            rates = self._mt5.copy_rates_from_pos(broker_symbol, tf, 0, count)
             if rates is not None and len(rates) > 0:
                 break
             time.sleep(1)
 
         if rates is None or len(rates) == 0:
-            print(f"MT5: no {timeframe} candles for {pair} after retries. "
+            print(f"MT5: no {timeframe} candles for {pair} ('{broker_symbol}') after retries. "
                   f"last_error={self._mt5.last_error()}")
             return None
 
@@ -176,10 +205,13 @@ class MT5Connector:
         if not self._connected:
             return {"success": False, "error": "MT5 not connected"}
 
-        self._ensure_symbol(pair)
+        broker_symbol = self._ensure_symbol(pair)
+        if broker_symbol is None:
+            return {"success": False, "error": f"No broker symbol found for {pair}"}
+
         order_type = self._mt5.ORDER_TYPE_BUY if direction == "BUY" else self._mt5.ORDER_TYPE_SELL
 
-        tick = self._mt5.symbol_info_tick(pair)
+        tick = self._mt5.symbol_info_tick(broker_symbol)
         if tick is None:
             return {"success": False, "error": f"No price for {pair}"}
 
@@ -187,7 +219,7 @@ class MT5Connector:
 
         request = {
             "action":       self._mt5.TRADE_ACTION_DEAL,
-            "symbol":       pair,
+            "symbol":       broker_symbol,
             "volume":       lot_size,
             "type":         order_type,
             "price":        price,
