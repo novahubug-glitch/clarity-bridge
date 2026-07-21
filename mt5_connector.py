@@ -177,10 +177,15 @@ class MT5Connector:
         positions = self._mt5.positions_get()
         if positions is None:
             return []
+        # MT5 reports positions under the broker's actual symbol name
+        # (e.g. "EURUSDm"), but everything upstream (Feed, Engine 2/3)
+        # uses canonical names ("EURUSD") — translate back so duplicate-
+        # position and max-concurrent checks in Cloud actually match.
+        reverse_map = {v: k for k, v in self._symbol_map.items() if v}
         return [
             {
                 "ticket":    p.ticket,
-                "pair":      p.symbol,
+                "pair":      reverse_map.get(p.symbol, p.symbol),
                 "direction": "BUY" if p.type == 0 else "SELL",
                 "lot_size":  p.volume,
                 "open_price": p.price_open,

@@ -89,6 +89,7 @@ class ClarityBridge:
             "account":   self.mt5.account_info(),
             "prices":    {},
             "candles":   {},
+            "positions": self.mt5.get_open_positions(),
         }
 
         for pair in pairs:
