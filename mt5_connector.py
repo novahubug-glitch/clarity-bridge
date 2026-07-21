@@ -9,6 +9,7 @@ It is a data pipe between MT5 and Clarity Bridge.
 """
 
 import json
+import time
 from typing import Optional
 
 
@@ -27,10 +28,20 @@ class MT5Connector:
         """
         if pair in self._selected_symbols:
             return True
-        if self._mt5.symbol_select(pair, True):
-            self._selected_symbols.add(pair)
-            return True
-        return False
+
+        info = self._mt5.symbol_info(pair)
+        if info is None:
+            print(f"MT5: '{pair}' doesn't exist under this exact name for this broker. "
+                  f"last_error={self._mt5.last_error()}")
+            return False
+
+        if not info.visible:
+            if not self._mt5.symbol_select(pair, True):
+                print(f"MT5: symbol_select('{pair}') failed. last_error={self._mt5.last_error()}")
+                return False
+
+        self._selected_symbols.add(pair)
+        return True
 
     def connect(self) -> bool:
         try:
@@ -105,8 +116,18 @@ class MT5Connector:
         if tf is None:
             return None
 
-        rates = self._mt5.copy_rates_from_pos(pair, tf, 0, count)
-        if rates is None:
+        # A freshly-selected symbol sometimes needs a moment for MT5 to sync
+        # history from the broker server — retry briefly before giving up.
+        rates = None
+        for attempt in range(3):
+            rates = self._mt5.copy_rates_from_pos(pair, tf, 0, count)
+            if rates is not None and len(rates) > 0:
+                break
+            time.sleep(1)
+
+        if rates is None or len(rates) == 0:
+            print(f"MT5: no {timeframe} candles for {pair} after retries. "
+                  f"last_error={self._mt5.last_error()}")
             return None
 
         return [
