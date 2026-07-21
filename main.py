@@ -77,6 +77,34 @@ class ClarityBridge:
             self._execute_loop(),   # Cloud → MT5
         )
 
+    def _collect_market_data(self, pairs: list, timeframes: list) -> dict:
+        """
+        All synchronous, blocking MT5 calls happen here. Called via
+        asyncio.to_thread() so the event loop stays free to handle
+        WebSocket ping/pong and the execute loop while this runs.
+        """
+        payload = {
+            "type":      "market_data",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "account":   self.mt5.account_info(),
+            "prices":    {},
+            "candles":   {},
+        }
+
+        for pair in pairs:
+            price = self.mt5.get_price(pair)
+            if price:
+                payload["prices"][pair] = price
+
+        for pair in pairs:
+            payload["candles"][pair] = {}
+            for tf in timeframes:
+                candles = self.mt5.get_candles(pair, tf, count=500)
+                if candles is not None:
+                    payload["candles"][pair][tf] = candles
+
+        return payload
+
     async def _stream_loop(self):
         """Continuously stream market data from MT5 to Cloud."""
         PAIRS = [
@@ -87,28 +115,11 @@ class ClarityBridge:
 
         while self.running:
             try:
-                payload = {
-                    "type":      "market_data",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "account":   self.mt5.account_info(),
-                    "prices":    {},
-                    "candles":   {},
-                }
-
-                # Current prices for all pairs
-                for pair in PAIRS:
-                    price = self.mt5.get_price(pair)
-                    if price:
-                        payload["prices"][pair] = price
-
-                # Candles for each pair/timeframe
-                for pair in PAIRS:
-                    payload["candles"][pair] = {}
-                    for tf in TIMEFRAMES:
-                        candles = self.mt5.get_candles(pair, tf, count=500)
-                        if candles is not None:
-                            payload["candles"][pair][tf] = candles
-
+                # Offload every blocking MT5 call to a worker thread —
+                # keeps this coroutine non-blocking so the WebSocket
+                # connection (ping/pong, execute loop) stays responsive
+                # while MT5 is being queried.
+                payload = await asyncio.to_thread(self._collect_market_data, PAIRS, TIMEFRAMES)
                 await self.cloud.send(payload)
 
             except Exception as e:
@@ -125,7 +136,8 @@ class ClarityBridge:
                 msg_type = msg.get("type")
 
                 if msg_type == "execute_order":
-                    result = self.mt5.place_order(
+                    result = await asyncio.to_thread(
+                        self.mt5.place_order,
                         pair      = msg["pair"],
                         direction = msg["direction"],
                         lot_size  = msg["lot_size"],
@@ -141,7 +153,7 @@ class ClarityBridge:
                     })
 
                 elif msg_type == "close_position":
-                    result = self.mt5.close_position(msg["ticket"])
+                    result = await asyncio.to_thread(self.mt5.close_position, msg["ticket"])
                     await self.cloud.send({
                         "type":      "close_result",
                         "request_id": msg.get("request_id"),
@@ -150,7 +162,8 @@ class ClarityBridge:
                     })
 
                 elif msg_type == "modify_position":
-                    result = self.mt5.modify_position(
+                    result = await asyncio.to_thread(
+                        self.mt5.modify_position,
                         ticket = msg["ticket"],
                         sl     = msg.get("sl"),
                         tp     = msg.get("tp"),
