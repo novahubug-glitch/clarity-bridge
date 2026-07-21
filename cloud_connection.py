@@ -40,7 +40,7 @@ class CloudConnection:
             self._ws = await websockets.connect(
                 CLARITY_CLOUD_WS_URL,
                 ping_interval = 20,
-                ping_timeout  = 10,
+                ping_timeout  = 30,
             )
 
             # Authenticate with our permanent device identity —
