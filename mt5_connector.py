@@ -171,6 +171,31 @@ class MT5Connector:
             for r in rates
         ]
 
+    def get_closed_trade(self, ticket: int) -> Optional[dict]:
+        """
+        Looks up the closing deal for a position ticket that's no longer
+        open. This is how SL/TP-triggered closes get detected — they never
+        pass through close_position() since the broker closes them
+        automatically, not Bridge.
+        """
+        if not self._connected:
+            return None
+        deals = self._mt5.history_deals_get(position=ticket)
+        if not deals:
+            return None
+        exit_deals = [d for d in deals if d.entry == self._mt5.DEAL_ENTRY_OUT]
+        if not exit_deals:
+            return None
+        exit_deal = exit_deals[-1]
+        return {
+            "ticket":      ticket,
+            "close_price": exit_deal.price,
+            "profit":      exit_deal.profit,
+            "commission":  exit_deal.commission,
+            "swap":        exit_deal.swap,
+            "close_time":  int(exit_deal.time),
+        }
+
     def get_open_positions(self) -> list:
         if not self._connected:
             return []
@@ -249,6 +274,72 @@ class MT5Connector:
             "comment":  result.comment,
         }
 
+    def close_position_partial(self, ticket: int, volume: float) -> dict:
+        """
+        Closes PART of a position — same DEAL mechanism as a full close,
+        just with volume < the position's full size. MT5 handles this as
+        a partial close automatically; the position stays open with the
+        remainder still running.
+        """
+        if not self._connected:
+            return {"success": False, "error": "MT5 not connected"}
+
+        position = self._mt5.positions_get(ticket=ticket)
+        if not position:
+            return {"success": False, "error": f"Position {ticket} not found"}
+
+        pos = position[0]
+        volume = round(min(volume, pos.volume), 2)
+        if volume < 0.01:
+            return {"success": False, "error": f"Partial volume {volume} below minimum lot size"}
+
+        close_type = self._mt5.ORDER_TYPE_SELL if pos.type == 0 else self._mt5.ORDER_TYPE_BUY
+        tick = self._mt5.symbol_info_tick(pos.symbol)
+        price = tick.bid if pos.type == 0 else tick.ask
+
+        request = {
+            "action":       self._mt5.TRADE_ACTION_DEAL,
+            "symbol":       pos.symbol,
+            "volume":       volume,
+            "type":         close_type,
+            "position":     ticket,
+            "price":        price,
+            "deviation":    10,
+            "magic":        20260101,
+            "comment":      "Clarity partial",
+            "type_time":    self._mt5.ORDER_TIME_GTC,
+            "type_filling": self._mt5.ORDER_FILLING_IOC,
+        }
+
+        result = self._mt5.order_send(request)
+        if result is None:
+            return {"success": False, "error": str(self._mt5.last_error())}
+
+        success = result.retcode == self._mt5.TRADE_RETCODE_DONE
+        if not success:
+            return {"success": False, "retcode": result.retcode, "error": str(self._mt5.last_error())}
+
+        # order_send's immediate result doesn't reliably carry profit/
+        # commission/swap — look up the actual closing deal, same as
+        # get_closed_trade does for full closes.
+        profit, commission, swap = 0.0, 0.0, 0.0
+        deals = self._mt5.history_deals_get(position=ticket)
+        if deals:
+            out_deals = [d for d in deals if d.entry == self._mt5.DEAL_ENTRY_OUT]
+            if out_deals:
+                last = out_deals[-1]
+                profit, commission, swap = last.profit, last.commission, last.swap
+
+        return {
+            "success":       True,
+            "retcode":       result.retcode,
+            "price":         result.price,
+            "profit":        profit,
+            "commission":    commission,
+            "swap":          swap,
+            "volume_closed": volume,
+        }
+
     def close_position(self, ticket: int) -> dict:
         if not self._connected:
             return {"success": False, "error": "MT5 not connected"}
@@ -294,17 +385,40 @@ class MT5Connector:
         if not position:
             return {"success": False, "error": f"Position {ticket} not found"}
 
-        pos = position[0]
+        pos    = position[0]
+        new_sl = sl if sl is not None else pos.sl
+        new_tp = tp if tp is not None else pos.tp
+
+        # Broker "freeze zone" / stops level — a modification too close to
+        # the current price gets rejected outright by the broker. Check
+        # first so a rejection has a clear reason instead of a bare
+        # generic broker error code.
+        info = self._mt5.symbol_info(pos.symbol)
+        tick = self._mt5.symbol_info_tick(pos.symbol)
+        if info and tick and info.trade_stops_level > 0:
+            min_distance = info.trade_stops_level * info.point
+            ref_price = tick.bid if pos.type == 0 else tick.ask
+            if new_sl and abs(ref_price - new_sl) < min_distance:
+                return {
+                    "success": False,
+                    "error": f"SL too close to price — broker requires >= {min_distance:.5f} distance (freeze/stops level)",
+                }
+
         request = {
             "action":   self._mt5.TRADE_ACTION_SLTP,
             "symbol":   pos.symbol,
             "position": ticket,
-            "sl":       sl if sl is not None else pos.sl,
-            "tp":       tp if tp is not None else pos.tp,
+            "sl":       new_sl,
+            "tp":       new_tp,
         }
 
         result = self._mt5.order_send(request)
         if result is None:
             return {"success": False, "error": str(self._mt5.last_error())}
 
-        return {"success": result.retcode == self._mt5.TRADE_RETCODE_DONE}
+        success = result.retcode == self._mt5.TRADE_RETCODE_DONE
+        return {
+            "success": success,
+            "retcode": result.retcode,
+            "error":   None if success else str(self._mt5.last_error()),
+        }
