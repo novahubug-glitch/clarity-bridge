@@ -21,7 +21,7 @@ from typing import AsyncIterator
 
 CLARITY_CLOUD_WS_URL = os.environ.get(
     "CLARITY_CLOUD_WS_URL",
-    "wss://algo.clarity.trade/bridge/ws"
+    "wss://web-production-1b8fe.up.railway.app/bridge/ws"
 )
 
 

@@ -269,7 +269,7 @@ class ClarityBridge:
 async def main():
     from device_auth import load_device_credentials, prompt_for_pairing
 
-    cloud_http_url = os.environ.get("CLARITY_CLOUD_HTTP_URL", "https://algo.clarity.trade")
+    cloud_http_url = os.environ.get("CLARITY_CLOUD_HTTP_URL", "https://web-production-1b8fe.up.railway.app")
 
     download_url, latest_version = check_for_update(cloud_http_url)
     if download_url:
