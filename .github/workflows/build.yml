@@ -1,0 +1,69 @@
+name: Build Windows Installer
+
+# Runs on a real Windows machine in GitHub's cloud — no local Windows
+# environment needed. Triggered by pushing a version tag (git tag v1.0.1 &&
+# git push --tags) or manually from the Actions tab ("Run workflow").
+#
+# Always publishes to the 'latest' release, matching the download URL
+# already wired into ConnectBrokerModal.jsx:
+#   .../clarity-bridge/releases/latest/download/ClarityBridge-Setup.exe
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Set version from tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          sed -i "s/^VERSION = .*/VERSION = \"$VER\"/" main.py
+          echo "Building as version $VER"
+
+      - name: Build executable
+        run: pyinstaller build.spec --clean --noconfirm
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss'
+
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          # Same filename on every release — "one installer forever."
+          # GitHub's own /releases/latest resolution always points at
+          # whichever real version tag was published most recently.
+          files: installer_output/ClarityBridge-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

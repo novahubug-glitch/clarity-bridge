@@ -19,8 +19,11 @@ All intelligence lives in Clarity Cloud.
 import asyncio
 import json
 import os
+import subprocess
+import tempfile
 import time
 import sys
+import urllib.request
 from datetime import datetime, timezone
 
 from mt5_connector import MT5Connector
@@ -31,12 +34,61 @@ VERSION = "1.0.0"
 RECONNECT_DELAY = 5   # seconds between reconnect attempts
 
 
+def check_for_update(cloud_http_url: str):
+    """
+    Asks Cloud for the current version — never GitHub directly. This is
+    the abstraction point: swap GitHub for S3/R2/a CDN later and neither
+    Bridge nor the frontend need to change, since they only ever talk to
+    Cloud's own /bridge/version and /bridge/download endpoints.
+    Returns (download_url, latest_version) or (None, None) if up to date
+    or the check fails (fails open — never blocks Bridge from starting).
+    """
+    try:
+        req = urllib.request.Request(f"{cloud_http_url.rstrip('/')}/bridge/version")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest_version = data.get("version")
+        download_url   = data.get("download_url")
+        if latest_version and download_url and latest_version != VERSION:
+            return download_url, latest_version
+    except Exception as e:
+        print(f"Update check failed (continuing on current version): {e}")
+    return None, None
+
+
+def download_and_install_update(download_url: str) -> bool:
+    """
+    Downloads the installer and runs it silently, then this process exits
+    so the installer can overwrite the running .exe — same pattern VS Code/
+    Discord use. Returns True if the install was launched (caller should
+    exit immediately after), False if anything failed (caller keeps running
+    on the current version).
+    """
+    try:
+        installer_path = os.path.join(tempfile.gettempdir(), "ClarityBridge-Setup.exe")
+        print(f"Downloading update from {download_url}...")
+        urllib.request.urlretrieve(download_url, installer_path)
+
+        print("Installing update — Bridge will restart automatically...")
+        # DETACHED_PROCESS so the installer survives this process exiting.
+        creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+        subprocess.Popen(
+            [installer_path, "/VERYSILENT", "/NORESTART"],
+            close_fds=True, creationflags=creationflags,
+        )
+        return True
+    except Exception as e:
+        print(f"Update install failed, continuing on current version: {e}")
+        return False
+
+
 class ClarityBridge:
 
     def __init__(self, device_id: str, device_secret: str):
         self.mt5         = MT5Connector()
         self.cloud       = CloudConnection(device_id, device_secret)
         self.running     = False
+        self._known_tickets = set()  # open position tickets as of the last cycle
 
     async def start(self):
         print(f"Clarity Bridge v{VERSION} starting...")
@@ -91,6 +143,20 @@ class ClarityBridge:
             "candles":   {},
             "positions": self.mt5.get_open_positions(),
         }
+
+        # Detect closes — a ticket that was open last cycle but isn't now
+        # closed via SL, TP, or manually in the terminal. This is the common
+        # case; explicit close_position() commands are the exception.
+        current_tickets = {p["ticket"] for p in payload["positions"]}
+        closed_tickets   = self._known_tickets - current_tickets
+        self._known_tickets = current_tickets
+
+        closed_trades = []
+        for ticket in closed_tickets:
+            info = self.mt5.get_closed_trade(ticket)
+            if info:
+                closed_trades.append(info)
+        payload["closed_trades"] = closed_trades
 
         for pair in pairs:
             price = self.mt5.get_price(pair)
@@ -162,6 +228,18 @@ class ClarityBridge:
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
 
+                elif msg_type == "close_partial":
+                    result = await asyncio.to_thread(
+                        self.mt5.close_position_partial, msg["ticket"], msg["volume"],
+                    )
+                    await self.cloud.send({
+                        "type":      "partial_close_result",
+                        "request_id": msg.get("request_id"),
+                        "ticket":    msg["ticket"],
+                        "result":    result,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+
                 elif msg_type == "modify_position":
                     result = await asyncio.to_thread(
                         self.mt5.modify_position,
@@ -192,6 +270,12 @@ async def main():
     from device_auth import load_device_credentials, prompt_for_pairing
 
     cloud_http_url = os.environ.get("CLARITY_CLOUD_HTTP_URL", "https://algo.clarity.trade")
+
+    download_url, latest_version = check_for_update(cloud_http_url)
+    if download_url:
+        print(f"New version available: {latest_version} (current: {VERSION})")
+        if download_and_install_update(download_url):
+            sys.exit(0)  # installer takes over from here; this process must exit
 
     device_id, device_secret = load_device_credentials()
     if not device_id:
