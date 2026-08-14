@@ -5,14 +5,21 @@
 
 block_cipher = None
 
+from PyInstaller.utils.hooks import collect_all
+
+# hiddenimports alone tells PyInstaller a module exists — it does NOT pull
+# in a package's binaries/data files. numpy and MetaTrader5 both ship
+# compiled extensions, so they need the fuller collect_all() treatment.
+# (This was the root cause of every shipped build missing numpy.)
+numpy_datas, numpy_binaries, numpy_hiddenimports = collect_all('numpy')
+mt5_datas, mt5_binaries, mt5_hiddenimports = collect_all('MetaTrader5')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
-    # MetaTrader5 is a C-extension package — PyInstaller's import scanner
-    # can miss it without this being explicit.
-    hiddenimports=['MetaTrader5'],
+    binaries=numpy_binaries + mt5_binaries,
+    datas=numpy_datas + mt5_datas,
+    hiddenimports=numpy_hiddenimports + mt5_hiddenimports + ['MetaTrader5', 'numpy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

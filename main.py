@@ -271,11 +271,17 @@ async def main():
 
     cloud_http_url = os.environ.get("CLARITY_CLOUD_HTTP_URL", "https://web-production-1b8fe.up.railway.app")
 
-    download_url, latest_version = check_for_update(cloud_http_url)
-    if download_url:
-        print(f"New version available: {latest_version} (current: {VERSION})")
-        if download_and_install_update(download_url):
-            sys.exit(0)  # installer takes over from here; this process must exit
+    # Auto-update only makes sense for the packaged exe — VERSION here is a
+    # placeholder that CI overwrites at build time, so a raw `python main.py`
+    # dev run always looks "outdated" and would otherwise self-replace with
+    # the installed build on every single run. sys.frozen is set by
+    # PyInstaller and is never true for a plain script invocation.
+    if getattr(sys, "frozen", False):
+        download_url, latest_version = check_for_update(cloud_http_url)
+        if download_url:
+            print(f"New version available: {latest_version} (current: {VERSION})")
+            if download_and_install_update(download_url):
+                sys.exit(0)  # installer takes over from here; this process must exit
 
     device_id, device_secret = load_device_credentials()
     if not device_id:

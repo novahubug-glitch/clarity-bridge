@@ -1,4 +1,8 @@
 # Pinned: the websockets API (extra_headers, request_headers) used in
 # cloud_connection.py changed significantly in 13.0+. Stay on 12.x.
 websockets==12.0
-MetaTrader5>=5.0.45
+MetaTrader5==5.0.5735
+# MetaTrader5 depends on this at import time, but it was never declared
+# here — CI's built exe has never actually bundled it. Pinned to match
+# what's been verified working in dev (numpy 2.3.5).
+numpy==2.3.5
