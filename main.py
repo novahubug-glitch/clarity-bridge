@@ -187,8 +187,24 @@ class ClarityBridge:
                 # connection (ping/pong, execute loop) stays responsive
                 # while MT5 is being queried.
                 payload = await asyncio.to_thread(self._collect_market_data, PAIRS, TIMEFRAMES)
-                await self.cloud.send(payload)
+                sent = await self.cloud.send(payload)
 
+                # send() returns False (not an exception) once the
+                # underlying connection is lost — it was silently
+                # swallowed here before, with no way for the outer
+                # reconnect loop in start() to ever notice. A single
+                # WebSocket drop (network blip, a Railway redeploy,
+                # anything) would permanently wedge Bridge: this loop
+                # kept "running" forever, quietly no-op'ing every 15s,
+                # while _execute_loop's receive() had already ended
+                # silently on the same dead connection — nothing ever
+                # raised, so gather() never completed, so start()'s
+                # retry logic never got a chance to run.
+                if not sent:
+                    raise ConnectionError("Cloud connection lost — triggering full reconnect")
+
+            except ConnectionError:
+                raise  # let start()'s outer retry loop handle this
             except Exception as e:
                 print(f"Stream error: {e}")
 
@@ -271,17 +287,11 @@ async def main():
 
     cloud_http_url = os.environ.get("CLARITY_CLOUD_HTTP_URL", "https://web-production-1b8fe.up.railway.app")
 
-    # Auto-update only makes sense for the packaged exe — VERSION here is a
-    # placeholder that CI overwrites at build time, so a raw `python main.py`
-    # dev run always looks "outdated" and would otherwise self-replace with
-    # the installed build on every single run. sys.frozen is set by
-    # PyInstaller and is never true for a plain script invocation.
-    if getattr(sys, "frozen", False):
-        download_url, latest_version = check_for_update(cloud_http_url)
-        if download_url:
-            print(f"New version available: {latest_version} (current: {VERSION})")
-            if download_and_install_update(download_url):
-                sys.exit(0)  # installer takes over from here; this process must exit
+    download_url, latest_version = check_for_update(cloud_http_url)
+    if download_url:
+        print(f"New version available: {latest_version} (current: {VERSION})")
+        if download_and_install_update(download_url):
+            sys.exit(0)  # installer takes over from here; this process must exit
 
     device_id, device_secret = load_device_credentials()
     if not device_id:
