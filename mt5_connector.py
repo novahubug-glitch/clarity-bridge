@@ -8,9 +8,25 @@ Contains NO intelligence. NO decisions. NO analysis.
 It is a data pipe between MT5 and Clarity Bridge.
 """
 
+import functools
 import json
+import threading
 import time
 from typing import Optional
+
+import safety
+
+
+def _locked(fn):
+    """
+    Serialise every MT5 call. The MetaTrader5 package makes no thread-safety guarantees and
+    Bridge calls it from worker threads (data collection and order execution run concurrently).
+    """
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        with self._lock:
+            return fn(self, *a, **kw)
+    return wrapper
 
 
 class MT5Connector:
@@ -18,6 +34,7 @@ class MT5Connector:
     def __init__(self):
         self._mt5       = None
         self._connected = False
+        self._lock = threading.RLock()
         self._symbol_map = {}  # canonical pair (e.g. "EURUSD") -> actual broker symbol name, or None if unresolvable
 
     def _resolve_symbol(self, pair: str) -> Optional[str]:
@@ -51,6 +68,7 @@ class MT5Connector:
         self._symbol_map[pair] = None
         return None
 
+    @_locked
     def _ensure_symbol(self, pair: str) -> Optional[str]:
         """
         Resolves the pair to this broker's actual symbol name and makes
@@ -72,6 +90,7 @@ class MT5Connector:
 
         return broker_symbol
 
+    @_locked
     def connect(self) -> bool:
         try:
             import MetaTrader5 as mt5
@@ -94,11 +113,48 @@ class MT5Connector:
             print(f"MT5 connect error: {e}")
             return False
 
+    @_locked
     def disconnect(self):
         if self._mt5 and self._connected:
             self._mt5.shutdown()
             self._connected = False
 
+    def _filling_for(self, broker_symbol: str) -> int:
+        """Fill mode the BROKER allows for this symbol (was hard-coded IOC)."""
+        info = self._mt5.symbol_info(broker_symbol)
+        flags = int(getattr(info, "filling_mode", 0) or 0) if info else 0
+        return safety.pick_filling(flags, self._mt5.ORDER_FILLING_FOK,
+                                   self._mt5.ORDER_FILLING_IOC, self._mt5.ORDER_FILLING_RETURN)
+
+    @_locked
+    def symbol_facts(self, pair: str) -> Optional[dict]:
+        """
+        Facts MT5 reports for the broker's symbol. This is DATA (not strategy), and Cloud uses it
+        to size orders correctly. tick_value_loss is already expressed in the ACCOUNT currency.
+        """
+        if not self._connected:
+            return None
+        broker_symbol = self._ensure_symbol(pair)
+        if broker_symbol is None:
+            return None
+        i = self._mt5.symbol_info(broker_symbol)
+        if i is None:
+            return None
+        tv = getattr(i, "trade_tick_value_loss", 0) or getattr(i, "trade_tick_value", 0)
+        return {
+            "broker_symbol": broker_symbol,
+            "digits":        int(i.digits),
+            "point":         float(i.point),
+            "tick_size":     float(i.trade_tick_size),
+            "tick_value_loss": float(tv),
+            "contract_size": float(i.trade_contract_size),
+            "volume_min":    float(i.volume_min),
+            "volume_max":    float(i.volume_max),
+            "volume_step":   float(i.volume_step),
+            "stops_level":   int(i.trade_stops_level),
+        }
+
+    @_locked
     def account_info(self) -> dict:
         if not self._connected:
             return {}
@@ -116,6 +172,7 @@ class MT5Connector:
             "currency": info.currency,
         }
 
+    @_locked
     def get_price(self, pair: str) -> Optional[dict]:
         if not self._connected:
             return None
@@ -132,6 +189,7 @@ class MT5Connector:
             "time":   tick.time,
         }
 
+    @_locked
     def get_candles(self, pair: str, timeframe: str, count: int = 500) -> Optional[list]:
         if not self._connected:
             return None
@@ -171,6 +229,7 @@ class MT5Connector:
             for r in rates
         ]
 
+    @_locked
     def get_closed_trade(self, ticket: int) -> Optional[dict]:
         """
         Looks up the closing deal for a position ticket that's no longer
@@ -183,19 +242,25 @@ class MT5Connector:
         deals = self._mt5.history_deals_get(position=ticket)
         if not deals:
             return None
-        exit_deals = [d for d in deals if d.entry == self._mt5.DEAL_ENTRY_OUT]
+        exit_deals = [d for d in deals if d.entry in (self._mt5.DEAL_ENTRY_OUT, getattr(self._mt5, "DEAL_ENTRY_OUT_BY", -1))]
         if not exit_deals:
             return None
-        exit_deal = exit_deals[-1]
+        last = exit_deals[-1]
+        # Totals across EVERY deal of the position: profit from all exits (partial closes + final),
+        # and commission/swap/fee from entry AND exit deals. Previously only the last exit deal was
+        # reported, so partial-close profit and entry commission were lost from the Journal.
         return {
             "ticket":      ticket,
-            "close_price": exit_deal.price,
-            "profit":      exit_deal.profit,
-            "commission":  exit_deal.commission,
-            "swap":        exit_deal.swap,
-            "close_time":  int(exit_deal.time),
+            "close_price": last.price,
+            "profit":      float(sum(d.profit for d in exit_deals)),
+            "commission":  float(sum(d.commission for d in deals)),
+            "swap":        float(sum(d.swap for d in deals)),
+            "fee":         float(sum(getattr(d, "fee", 0) or 0 for d in deals)),
+            "close_time":  int(last.time),
+            "totals":      True,
         }
 
+    @_locked
     def get_open_positions(self) -> list:
         if not self._connected:
             return []
@@ -223,6 +288,7 @@ class MT5Connector:
             for p in positions
         ]
 
+    @_locked
     def place_order(
         self,
         pair:      str,
@@ -239,27 +305,48 @@ class MT5Connector:
         if broker_symbol is None:
             return {"success": False, "error": f"No broker symbol found for {pair}"}
 
-        order_type = self._mt5.ORDER_TYPE_BUY if direction == "BUY" else self._mt5.ORDER_TYPE_SELL
-
+        info = self._mt5.symbol_info(broker_symbol)
         tick = self._mt5.symbol_info_tick(broker_symbol)
-        if tick is None:
-            return {"success": False, "error": f"No price for {pair}"}
+        if info is None or tick is None:
+            return {"success": False, "error": f"No price or symbol details for {pair}"}
+        if getattr(info, "trade_mode", 4) == getattr(self._mt5, "SYMBOL_TRADE_MODE_DISABLED", 0):
+            return {"success": False, "error": f"Trading is disabled for {pair} at this broker"}
 
+        facts = {"digits": int(info.digits), "point": float(info.point),
+                 "volume_min": float(info.volume_min), "volume_max": float(info.volume_max),
+                 "volume_step": float(info.volume_step), "stops_level": int(info.trade_stops_level)}
         price = tick.ask if direction == "BUY" else tick.bid
 
+        # Duplicate guard: never open a second Clarity position on the same symbol.
+        existing = self._mt5.positions_get(symbol=broker_symbol) or []
+        if any(getattr(p, "magic", None) == safety.MAGIC for p in existing):
+            return {"success": False, "error": f"A Clarity position on {pair} is already open"}
+
+        # Normalise to the broker's own rules (digits, volume step/min), never round UP.
+        d = facts["digits"]
+        sl, tp, price = round(float(sl), d), round(float(tp), d), round(float(price), d)
+        lot = safety.floor_to_step(float(lot_size), facts["volume_step"])
+        if lot < facts["volume_min"]:
+            return {"success": False, "error": f"Lot size {lot_size} is below the broker minimum {facts['volume_min']}"}
+
+        err = safety.validate_order(pair, direction, lot, sl, tp, price, facts)
+        if err:
+            return {"success": False, "error": f"Rejected by Bridge safety check: {err}"}
+
+        order_type = self._mt5.ORDER_TYPE_BUY if direction == "BUY" else self._mt5.ORDER_TYPE_SELL
         request = {
             "action":       self._mt5.TRADE_ACTION_DEAL,
             "symbol":       broker_symbol,
-            "volume":       lot_size,
+            "volume":       lot,
             "type":         order_type,
             "price":        price,
             "sl":           sl,
             "tp":           tp,
             "deviation":    10,
-            "magic":        20260101,
-            "comment":      comment,
+            "magic":        safety.MAGIC,
+            "comment":      str(comment)[:31],            # MT5 limit
             "type_time":    self._mt5.ORDER_TIME_GTC,
-            "type_filling": self._mt5.ORDER_FILLING_IOC,
+            "type_filling": self._filling_for(broker_symbol),
         }
 
         result = self._mt5.order_send(request)
@@ -271,9 +358,11 @@ class MT5Connector:
             "retcode":  result.retcode,
             "ticket":   result.order,
             "price":    result.price,
+            "volume":   lot,
             "comment":  result.comment,
         }
 
+    @_locked
     def close_position_partial(self, ticket: int, volume: float) -> dict:
         """
         Closes PART of a position — same DEAL mechanism as a full close,
@@ -289,9 +378,12 @@ class MT5Connector:
             return {"success": False, "error": f"Position {ticket} not found"}
 
         pos = position[0]
-        volume = round(min(volume, pos.volume), 2)
-        if volume < 0.01:
-            return {"success": False, "error": f"Partial volume {volume} below minimum lot size"}
+        sinfo = self._mt5.symbol_info(pos.symbol)
+        step  = float(sinfo.volume_step) if sinfo else 0.01
+        vmin  = float(sinfo.volume_min)  if sinfo else 0.01
+        volume = safety.floor_to_step(min(volume, pos.volume), step)
+        if volume < vmin:
+            return {"success": False, "error": f"Partial volume {volume} below broker minimum {vmin}"}
 
         close_type = self._mt5.ORDER_TYPE_SELL if pos.type == 0 else self._mt5.ORDER_TYPE_BUY
         tick = self._mt5.symbol_info_tick(pos.symbol)
@@ -308,7 +400,7 @@ class MT5Connector:
             "magic":        20260101,
             "comment":      "Clarity partial",
             "type_time":    self._mt5.ORDER_TIME_GTC,
-            "type_filling": self._mt5.ORDER_FILLING_IOC,
+            "type_filling": self._filling_for(pos.symbol),
         }
 
         result = self._mt5.order_send(request)
@@ -340,6 +432,7 @@ class MT5Connector:
             "volume_closed": volume,
         }
 
+    @_locked
     def close_position(self, ticket: int) -> dict:
         if not self._connected:
             return {"success": False, "error": "MT5 not connected"}
@@ -364,7 +457,7 @@ class MT5Connector:
             "magic":        20260101,
             "comment":      "Clarity close",
             "type_time":    self._mt5.ORDER_TIME_GTC,
-            "type_filling": self._mt5.ORDER_FILLING_IOC,
+            "type_filling": self._filling_for(pos.symbol),
         }
 
         result = self._mt5.order_send(request)
@@ -377,6 +470,7 @@ class MT5Connector:
             "price":   result.price,
         }
 
+    @_locked
     def modify_position(self, ticket: int, sl: float = None, tp: float = None) -> dict:
         if not self._connected:
             return {"success": False, "error": "MT5 not connected"}
@@ -386,8 +480,10 @@ class MT5Connector:
             return {"success": False, "error": f"Position {ticket} not found"}
 
         pos    = position[0]
-        new_sl = sl if sl is not None else pos.sl
-        new_tp = tp if tp is not None else pos.tp
+        dinfo  = self._mt5.symbol_info(pos.symbol)
+        dg     = int(dinfo.digits) if dinfo else 5
+        new_sl = round(float(sl), dg) if sl is not None else pos.sl      # broker rejects prices with extra digits
+        new_tp = round(float(tp), dg) if tp is not None else pos.tp
 
         # Broker "freeze zone" / stops level — a modification too close to
         # the current price gets rejected outright by the broker. Check

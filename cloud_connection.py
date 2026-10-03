@@ -25,6 +25,9 @@ CLARITY_CLOUD_WS_URL = os.environ.get(
 )
 
 
+from version import VERSION
+
+
 class CloudConnection:
 
     def __init__(self, device_id: str, device_secret: str):
@@ -49,7 +52,7 @@ class CloudConnection:
                 "type":          "bridge_connect",
                 "device_id":     self.device_id,
                 "device_secret": self.device_secret,
-                "version":       "1.0.0",
+                "version":       VERSION,
             }))
 
             response = json.loads(await self._ws.recv())

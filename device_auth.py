@@ -51,8 +51,15 @@ def load_device_credentials():
 
 def save_device_credentials(device_id: str, device_secret: str) -> None:
     os.makedirs(_config_dir(), exist_ok=True)
-    with open(_config_path(), "w") as f:
+    # Owner-only (0600) on POSIX. On Windows file ACLs inherit from %APPDATA% (per-user); a follow-up
+    # should move the secret into Windows Credential Manager / DPAPI.
+    fd = os.open(_config_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump({"device_id": device_id, "device_secret": device_secret}, f)
+    try:
+        os.chmod(_config_path(), 0o600)
+    except OSError:
+        pass
 
 
 def pair_with_code(code: str, cloud_http_url: str, platform_name: str = "MT5"):
