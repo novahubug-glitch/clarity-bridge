@@ -70,7 +70,7 @@ class OrderTests(unittest.TestCase):
         f = connector().symbol_facts("EURUSD")
         self.assertEqual((f["digits"], f["volume_step"], f["tick_value_loss"]), (5, 0.01, 1.25))
     def test_modify_rounds_to_digits(self):
-        c = connector(); c._mt5._positions = [Obj(symbol="EURUSDm", sl=0, tp=0, type=0)]
+        c = connector(); c._mt5._positions = [Obj(symbol="EURUSDm", sl=0, tp=0, type=0, magic=safety.MAGIC)]
         c._mt5.positions_get = lambda **kw: c._mt5._positions
         c.modify_position(5, sl=1.0950000000123); self.assertEqual(c._mt5.sent[0]["sl"], 1.095)
 
@@ -111,6 +111,99 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(safety.sha256_file(p), hashlib.sha256(b"abc").hexdigest())
     def test_floor_step_float_noise(self):
         self.assertEqual(safety.floor_to_step(0.49999999999, 0.01), 0.5)
+
+
+class ModifyProtection(unittest.TestCase):
+    """Phase 6: the Bridge may only tighten risk on its own positions. Bid 1.09998 / ask 1.10002 in FakeMT5."""
+    def _pos(self, **kw):
+        return Obj(symbol="EURUSDm", ticket=5, type=kw.pop("type", 0), sl=kw.pop("sl", 1.0950), tp=kw.pop("tp", 1.1100),
+                   volume=kw.pop("volume", 0.2), magic=kw.pop("magic", safety.MAGIC))
+    def _c(self, **pos):
+        c = connector(); c._mt5._positions = [self._pos(**pos)]; c._mt5.positions_get = lambda **kw: c._mt5._positions; return c
+
+    def test_tightening_a_buy_stop_is_allowed(self):
+        c = self._c(); r = c.modify_position(5, sl=1.0970)
+        self.assertTrue(r["success"]); self.assertEqual(c._mt5.sent[0]["sl"], 1.097)
+    def test_zero_stop_would_remove_protection_and_is_refused(self):
+        c = self._c(); r = c.modify_position(5, sl=0)
+        self.assertFalse(r["success"]); self.assertEqual(c._mt5.sent, [])
+    def test_negative_or_non_numeric_stop_refused(self):
+        for bad in (-1.0, float("nan"), True):
+            c = self._c(); self.assertFalse(c.modify_position(5, sl=bad)["success"]); self.assertEqual(c._mt5.sent, [])
+    def test_widening_a_buy_stop_refused(self):
+        c = self._c(sl=1.0950); r = c.modify_position(5, sl=1.0900)
+        self.assertFalse(r["success"]); self.assertIn("wider", r["error"]); self.assertEqual(c._mt5.sent, [])
+    def test_widening_a_sell_stop_refused_and_tightening_allowed(self):
+        c = self._c(type=1, sl=1.1050, tp=1.0900); self.assertFalse(c.modify_position(5, sl=1.1100)["success"])
+        self.assertTrue(c.modify_position(5, sl=1.1030)["success"])
+    def test_stop_on_wrong_side_of_market_refused(self):
+        c = self._c(); self.assertFalse(c.modify_position(5, sl=1.2000)["success"]); self.assertEqual(c._mt5.sent, [])
+    def test_position_not_opened_by_clarity_is_never_touched(self):
+        c = self._c(magic=0)
+        for r in (c.modify_position(5, sl=1.0970), c.close_position(5), c.close_position_partial(5, 0.1)):
+            self.assertFalse(r["success"]); self.assertIn("not opened by Clarity", r["error"])
+        self.assertEqual(c._mt5.sent, [])
+
+class PartialCloseNeverClosesEverything(unittest.TestCase):
+    def _c(self, volume):
+        c = connector(); c._mt5._positions = [Obj(symbol="EURUSDm", ticket=5, type=0, sl=1.095, tp=1.11, volume=volume, magic=safety.MAGIC)]
+        c._mt5.positions_get = lambda **kw: c._mt5._positions; return c
+    def test_minimum_lot_position_cannot_be_partially_closed(self):
+        c = self._c(0.01); r = c.close_position_partial(5, 0.01)
+        self.assertFalse(r["success"]); self.assertEqual(c._mt5.sent, [])
+    def test_request_larger_than_position_is_not_a_full_close(self):
+        c = self._c(0.2); r = c.close_position_partial(5, 5.0)
+        self.assertFalse(r["success"]); self.assertEqual(c._mt5.sent, [])
+    def test_normal_partial_still_works(self):
+        c = self._c(0.2); r = c.close_position_partial(5, 0.1)
+        self.assertTrue(r["success"]); self.assertEqual(c._mt5.sent[0]["volume"], 0.1)
+
+class PositionSnapshotErrors(unittest.TestCase):
+    """An MT5 error is not the same as 'nothing is open'."""
+    def test_connector_reports_none_on_error_and_empty_list_when_flat(self):
+        c = connector(); c._mt5.positions_get = lambda **kw: None
+        self.assertIsNone(c.get_open_positions())
+        c._mt5.positions_get = lambda **kw: []
+        self.assertEqual(c.get_open_positions(), [])
+    def test_error_does_not_close_known_tickets_or_wipe_state(self):
+        import main, tempfile
+        main._config_dir = lambda: tempfile.mkdtemp()
+        b = main.ClarityBridge("d", "s"); b._known_tickets = {5, 6}
+        class M:
+            def account_info(self): return {"balance": 1000}
+            def get_open_positions(self): return None
+            def get_closed_trade(self, t): raise AssertionError("must not look for closes during an MT5 error")
+            def symbol_facts(self, p): return None
+            def get_price(self, p): return None
+            def get_candles(self, *a, **k): return None
+        b.mt5 = M()
+        payload = b._collect_market_data(["EURUSD"], ["M5"])
+        self.assertFalse(payload["positions_ok"]); self.assertEqual(payload["closed_trades"], [])
+        self.assertEqual(b._known_tickets, {5, 6})                 # remembered, so real closes are still detected later
+    def test_healthy_snapshot_is_flagged_ok(self):
+        import main, tempfile
+        main._config_dir = lambda: tempfile.mkdtemp()
+        b = main.ClarityBridge("d", "s")
+        class M:
+            def account_info(self): return {"balance": 1000}
+            def get_open_positions(self): return []
+            def get_closed_trade(self, t): return None
+            def symbol_facts(self, p): return None
+            def get_price(self, p): return None
+            def get_candles(self, *a, **k): return None
+        b.mt5 = M(); self.assertTrue(b._collect_market_data(["EURUSD"], ["M5"])["positions_ok"])
+
+
+class ValidateModifyUnit(unittest.TestCase):
+    def test_table(self):
+        v = safety.validate_modify
+        self.assertIsNone(v("BUY", 1.0999, 1.1001, 1.095, 1.11, 1.097, None, 0.00001))
+        self.assertIsNone(v("BUY", 1.0999, 1.1001, 0, 0, 1.097, None, 0.00001))          # no stop yet: setting one is fine
+        self.assertIsNotNone(v("BUY", 1.0999, 1.1001, 1.095, 1.11, None, None))           # nothing to do
+        self.assertIsNotNone(v("SELL", 1.0999, 1.1001, 1.105, 1.09, 1.106, None, 0.00001))
+        self.assertIsNotNone(v("BUY", 0, 1.1001, 1.095, 1.11, 1.097, None))               # no valid price
+        self.assertIsNotNone(v("BUY", 1.0999, 1.1001, 1.095, 1.11, None, 1.05))           # target on the wrong side
+        self.assertIsNone(v("BUY", 1.0999, 1.1001, 1.095, 1.11, 1.095, None, 0.00001))   # same stop: harmless no-op
 
 
 if __name__ == "__main__":

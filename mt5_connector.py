@@ -261,12 +261,13 @@ class MT5Connector:
         }
 
     @_locked
-    def get_open_positions(self) -> list:
+    def get_open_positions(self) -> Optional[list]:
+        """The open positions, or None when MT5 could not report them (an error is NOT an empty list)."""
         if not self._connected:
-            return []
+            return None
         positions = self._mt5.positions_get()
         if positions is None:
-            return []
+            return None
         # MT5 reports positions under the broker's actual symbol name
         # (e.g. "EURUSDm"), but everything upstream (Feed, Engine 2/3)
         # uses canonical names ("EURUSD") — translate back so duplicate-
@@ -378,12 +379,16 @@ class MT5Connector:
             return {"success": False, "error": f"Position {ticket} not found"}
 
         pos = position[0]
+        if getattr(pos, "magic", None) != safety.MAGIC:
+            return {"success": False, "error": f"Position {ticket} was not opened by Clarity; Bridge will not manage it"}
         sinfo = self._mt5.symbol_info(pos.symbol)
         step  = float(sinfo.volume_step) if sinfo else 0.01
         vmin  = float(sinfo.volume_min)  if sinfo else 0.01
         volume = safety.floor_to_step(min(volume, pos.volume), step)
         if volume < vmin:
             return {"success": False, "error": f"Partial volume {volume} below broker minimum {vmin}"}
+        if pos.volume - volume < vmin - 1e-9:
+            return {"success": False, "error": "A partial close must leave at least the broker minimum open; it will not close the whole position"}
 
         close_type = self._mt5.ORDER_TYPE_SELL if pos.type == 0 else self._mt5.ORDER_TYPE_BUY
         tick = self._mt5.symbol_info_tick(pos.symbol)
@@ -397,7 +402,7 @@ class MT5Connector:
             "position":     ticket,
             "price":        price,
             "deviation":    10,
-            "magic":        20260101,
+            "magic":        safety.MAGIC,
             "comment":      "Clarity partial",
             "type_time":    self._mt5.ORDER_TIME_GTC,
             "type_filling": self._filling_for(pos.symbol),
@@ -442,6 +447,8 @@ class MT5Connector:
             return {"success": False, "error": f"Position {ticket} not found"}
 
         pos = position[0]
+        if getattr(pos, "magic", None) != safety.MAGIC:
+            return {"success": False, "error": f"Position {ticket} was not opened by Clarity; Bridge will not close it"}
         close_type = self._mt5.ORDER_TYPE_SELL if pos.type == 0 else self._mt5.ORDER_TYPE_BUY
         tick = self._mt5.symbol_info_tick(pos.symbol)
         price = tick.bid if pos.type == 0 else tick.ask
@@ -454,7 +461,7 @@ class MT5Connector:
             "position":     ticket,
             "price":        price,
             "deviation":    10,
-            "magic":        20260101,
+            "magic":        safety.MAGIC,
             "comment":      "Clarity close",
             "type_time":    self._mt5.ORDER_TIME_GTC,
             "type_filling": self._filling_for(pos.symbol),
@@ -480,8 +487,20 @@ class MT5Connector:
             return {"success": False, "error": f"Position {ticket} not found"}
 
         pos    = position[0]
+        if getattr(pos, "magic", None) != safety.MAGIC:
+            return {"success": False, "error": f"Position {ticket} was not opened by Clarity; Bridge will not modify it"}
         dinfo  = self._mt5.symbol_info(pos.symbol)
         dg     = int(dinfo.digits) if dinfo else 5
+        tick0  = self._mt5.symbol_info_tick(pos.symbol)
+        direction = "BUY" if pos.type == 0 else "SELL"
+        err = safety.validate_modify(
+            direction,
+            getattr(tick0, "bid", None), getattr(tick0, "ask", None),
+            float(pos.sl or 0), float(pos.tp or 0), sl, tp,
+            float(dinfo.point) if dinfo else 0.0,
+        )
+        if err:
+            return {"success": False, "error": f"Rejected by Bridge safety check: {err}"}
         new_sl = round(float(sl), dg) if sl is not None else pos.sl      # broker rejects prices with extra digits
         new_tp = round(float(tp), dg) if tp is not None else pos.tp
 

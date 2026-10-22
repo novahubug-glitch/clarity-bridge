@@ -159,14 +159,21 @@ class ClarityBridge:
             "account":   self.mt5.account_info(),
             "prices":    {},
             "candles":   {},
-            "positions": self.mt5.get_open_positions(),
+            "positions": [],
         }
+        positions = self.mt5.get_open_positions()
+        payload["positions_ok"] = positions is not None
+        if positions is not None:
+            payload["positions"] = positions
 
         # Detect closes — a ticket that was open last cycle but isn't now
         # closed via SL, TP, or manually in the terminal. This is the common
         # case; explicit close_position() commands are the exception.
         current_tickets = {p["ticket"] for p in payload["positions"]}
-        candidates = (self._known_tickets - current_tickets) | (set(self._unresolved_closed) - current_tickets)
+        # If MT5 could not report positions, do NOT treat every position as closed and do NOT overwrite the
+        # remembered open tickets: an error is not "nothing is open".
+        candidates = ((self._known_tickets - current_tickets) | (set(self._unresolved_closed) - current_tickets)) \
+            if positions is not None else set()
 
         closed_trades = []
         for ticket in candidates:
@@ -182,8 +189,9 @@ class ClarityBridge:
                     self._unresolved_closed.pop(ticket, None)
                 else:
                     self._unresolved_closed[ticket] = tries
-        self._known_tickets = current_tickets
-        save_json_atomic(self._state_path, {"open_tickets": sorted(current_tickets)})
+        if positions is not None:
+            self._known_tickets = current_tickets
+            save_json_atomic(self._state_path, {"open_tickets": sorted(current_tickets)})
         payload["closed_trades"] = closed_trades
 
         # Broker symbol facts (digits, tick value, volume rules) so Cloud can size orders correctly.

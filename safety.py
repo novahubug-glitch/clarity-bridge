@@ -75,6 +75,48 @@ def validate_order(pair, direction, lot, sl, tp, price, info: dict) -> Optional[
     return None
 
 
+def _num(v) -> bool:
+    return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def validate_modify(direction, bid, ask, cur_sl, cur_tp, new_sl, new_tp, point: float = 0.0) -> Optional[str]:
+    """
+    Checks a stop/target change on an open Clarity position. Returns an error string, or None if acceptable.
+
+    The Bridge only ever needs to TIGHTEN risk (breakeven, trailing), so it refuses anything else:
+      - a stop that is missing, zero, negative or not a number (that would REMOVE the protection);
+      - a stop on the wrong side of the market;
+      - a stop that moves AWAY from price, i.e. widens the risk, when a stop already exists.
+    """
+    if direction not in ("BUY", "SELL"):
+        return "invalid position direction"
+    if new_sl is None and new_tp is None:
+        return "nothing to modify"
+    if not (_num(bid) and _num(ask) and bid > 0 and ask > 0):
+        return "no valid market price"
+    eps = max(point, 1e-9) / 2
+    if new_sl is not None:
+        if not _num(new_sl) or new_sl <= 0:
+            return "invalid stop loss (a stop cannot be removed or zeroed)"
+        if direction == "BUY" and not new_sl < bid:
+            return "stop loss is not below the market for a BUY"
+        if direction == "SELL" and not new_sl > ask:
+            return "stop loss is not above the market for a SELL"
+        if _num(cur_sl) and cur_sl > 0:
+            if direction == "BUY" and new_sl < cur_sl - eps:
+                return "refused: this would move the stop away from price (wider risk)"
+            if direction == "SELL" and new_sl > cur_sl + eps:
+                return "refused: this would move the stop away from price (wider risk)"
+    if new_tp is not None:
+        if not _num(new_tp) or new_tp <= 0:
+            return "invalid take profit"
+        if direction == "BUY" and not new_tp > ask:
+            return "take profit is not above the market for a BUY"
+        if direction == "SELL" and not new_tp < bid:
+            return "take profit is not below the market for a SELL"
+    return None
+
+
 # ── Idempotency: never execute the same request_id twice ─────────────────────
 class RequestLedger:
     """
