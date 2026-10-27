@@ -190,7 +190,11 @@ class MT5Connector:
         }
 
     @_locked
-    def get_candles(self, pair: str, timeframe: str, count: int = 500) -> Optional[list]:
+    def get_candles(self, pair: str, timeframe: str, count: int = 500,
+                    include_forming: bool = False) -> Optional[list]:
+        """Closed candles only by default (F5). MT5 position 0 is the candle still forming;
+        its high, low and close keep changing, so structure built on it can repaint.
+        Pass include_forming=True only for a caller that explicitly wants the live bar."""
         if not self._connected:
             return None
         broker_symbol = self._ensure_symbol(pair)
@@ -207,7 +211,7 @@ class MT5Connector:
 
         rates = None
         for attempt in range(3):
-            rates = self._mt5.copy_rates_from_pos(broker_symbol, tf, 0, count)
+            rates = self._mt5.copy_rates_from_pos(broker_symbol, tf, 0 if include_forming else 1, count)
             if rates is not None and len(rates) > 0:
                 break
             time.sleep(1)

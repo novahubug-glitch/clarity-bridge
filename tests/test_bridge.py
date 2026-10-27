@@ -30,12 +30,26 @@ class FakeMT5:
         self.sent.append(req); return Obj(retcode=10009, order=777, price=req.get("price", 0), comment="ok")
     def last_error(self): return (1, "x")
     def history_deals_get(self, position=None): return self.deals
+    def copy_rates_from_pos(self, sym, tf, start_pos, count):
+        self.rates_requests = getattr(self, "rates_requests", []) + [(sym, tf, start_pos, count)]
+        return [{"time": 1700000000 + 900 * i, "open": 1.1, "high": 1.101, "low": 1.099, "close": 1.1005, "tick_volume": 10}
+                for i in range(3)]
 
 
 def connector(**kw):
     c = MT5Connector(); c._mt5 = FakeMT5(**kw); c._connected = True
     c._symbol_map = {"EURUSD": "EURUSDm"}
     return c
+
+
+class CandleTests(unittest.TestCase):
+    def test_closed_candles_only_by_default(self):
+        c = connector(); out = c.get_candles("EURUSD", "M15", 500)
+        self.assertEqual(c._mt5.rates_requests[0][2], 1)          # start at the last CLOSED candle, not the forming one
+        self.assertEqual(len(out), 3)
+    def test_forming_candle_only_when_explicitly_requested(self):
+        c = connector(); c.get_candles("EURUSD", "M5", 100, include_forming=True)
+        self.assertEqual(c._mt5.rates_requests[0][2], 0)
 
 
 class OrderTests(unittest.TestCase):
